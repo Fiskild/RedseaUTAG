@@ -1,0 +1,472 @@
+# Not needed functions
+def combined_connectivity(
+    slide_key: str = 'Slide',
+    domain_key: str = 'UTAG Label',
+    celltype_key: str = 'cluster_0.5_label',
+    mode: str = 'domain'  # mode can be 'domain', 'celltype', or 'slide'
+) -> AnnData:
+    """Calculates connectivity matrices based on spatial neighbors. Can operate in three modes
+    ("domain", "celltype", or "slide") depending on the usecase. """
+
+    order = sorted(adata.obs[domain_key].unique().tolist())
+    if mode == 'celltype':
+        cell_types = adata.obs[celltype_key].unique().tolist()
+
+    global_pairwise = {}
+    for slide in tqdm(adata.obs[slide_key].unique()):
+        adata_batch = adata[adata.obs[slide_key] == slide]
+        sq.gr.spatial_neighbors(adata_batch, radius = 40, coord_type = 'generic')
+
+        if mode == 'domain' or mode == 'slide':
+            pairwise_connection = pd.DataFrame(np.zeros((len(order), len(order))), index=order, columns=order)
+        elif mode == 'celltype':
+            pairwise_connection = pd.DataFrame(np.zeros((len(cell_types), len(cell_types))), index=cell_types, columns=cell_types)
+
+        for label in adata_batch.obs[domain_key].unique():
+            subset = adata_batch[adata_batch.obs[domain_key] == label]
+            self_connection = subset.obsp['spatial_connectivities'].todense().sum() / 2
+            self_connection = round(self_connection)
+
+            if mode == 'domain' or mode == 'slide':
+                pairwise_connection.loc[label, label] = self_connection
+            elif mode == 'celltype':
+                for cell_type in subset.obs[celltype_key].unique():
+                    subset_ct = subset[subset.obs[celltype_key] == cell_type]
+                    ct_connection = subset_ct.obsp['spatial_connectivities'].todense().sum() / 2
+                    pairwise_connection.loc[cell_type, cell_type] = ct_connection.round()
+
+        for label1 in adata_batch.obs[domain_key].unique():
+            for label2 in adata_batch.obs[domain_key].unique():
+                if label1 != label2:
+                    pairwise = adata_batch[adata_batch.obs[domain_key].isin([label1, label2])].obsp['spatial_connectivities'].todense().sum() / 2
+                    pairwise = round(pairwise)
+                    if mode == 'domain' or mode == 'slide':
+                        pairwise_connection.loc[label1, label2] = pairwise
+                        pairwise_connection.loc[label2, label1] = pairwise
+
+        if mode == 'slide':
+            global_pairwise[slide] = pairwise_connection
+        else:
+            global_pairwise = global_pairwise + pairwise_connection
+
+    if mode == 'slide':
+        return global_pairwise
+    else:
+        key_name = f'{domain_key}_connectivity_matrix' if mode == 'domain' else f'{celltype_key}_connectivity_matrix'
+        adata.uns[key_name] = global_pairwise
+        return adata
+
+#HNSW
+from collections import defaultdict
+
+class Node:
+    def __init__(self, value):
+        self.value = value
+        self.neighbors = defaultdict(list)  # Change to defaultdict
+
+class HNSW:
+    def __init__(self, M, Mmax, mL):
+        self.nodes = []
+        self.enter_point = None
+        self.M = M
+        self.Mmax = Mmax
+        self.mL = mL
+
+    #def _random_level(self):
+    #    """Generate a random level for a node based on the negative natural logarithm scaled by mL."""
+    #    level = int(-math.log(random.uniform(0.0001, 1)) * self.mL)  # avoid zero by setting a minimum value
+    #    return level
+
+    def _random_level(self):
+        p = 1 / math.e  # Base probability of advancing to the next level
+        level = 0
+        while random.random() < p and level < np.log(num_nodes):
+            level += 1
+        return level
+
+    def distance(self, node1, node2):
+        """Calculate the Euclidean distance between two nodes."""
+        return abs(node1.value - node2.value)
+
+    def insert(self, q):
+        if not self.nodes:
+            self.enter_point = q
+            self.nodes.append(q)
+            return
+
+        W = []
+        ep = self.enter_point
+        L = max(ep.neighbors.keys()) if ep.neighbors else 0
+        l = self._random_level()
+
+        # Check here to see if levels > 0 are being assigned
+        #print(f"Assigned level {l} to node with value {q.value}")
+
+        # Descend to find the closest entry point in each layer
+        for lc in range(L, l + 1):
+            W = self.search_layer(q, ep, 1, lc)
+            if W:  # ensure there is a result to avoid errors
+                ep = min(W, key=lambda n: self.distance(n, q))
+
+        # Insert connections from top level l down to level 0
+        for lc in range(min(L, l), -1, -1):
+            W = self.search_layer(q, ep, self.M, lc)
+            neighbors = self.select_neighbors_simple(q, W, self.M)
+            q.neighbors[lc].extend(neighbors)
+            for e in neighbors:
+                e.neighbors[lc].append(q)
+                if len(e.neighbors[lc]) > self.Mmax:
+                    e.neighbors[lc] = self.select_neighbors_simple(e, e.neighbors[lc], self.Mmax)
+
+        if l > L:
+            self.enter_point = q
+
+        self.nodes.append(q)
+
+
+    def search_layer(self, q, ep, ef, lc):
+        #ALGORITHM 2
+        visited = set()
+        candidates = [(0, id(ep), ep)]  # Use the id of the node to avoid direct node comparison
+        W = []
+
+        while candidates and len(W) < ef:
+            _, _, c = heappop(candidates)  # Adjust to unpack id as well
+            if c in visited:
+                continue
+            visited.add(c)
+            W.append(c)
+            for e in c.neighbors.get(lc, []):  # Ensure to handle if layer does not exist
+                if e not in visited:
+                    heappush(candidates, (self.distance(e, q), id(e), e))  # Use the id of the node here
+        return W[:ef]
+
+    def select_neighbors_simple(self, q, candidates, M):
+        #ALGORTHIM 3
+        candidates.sort(key=lambda n: self.distance(n, q))
+        return candidates[:M]
+
+    def select_neighbors_heuristic(self, q, candidates, M, lc, extendCandidates, keepPrunedConnections):
+        #ALGORTIHM 4
+        if extendCandidates:
+            extended_candidates = set(candidates)
+            for c in candidates:
+                extended_candidates.update(c.neighbors[lc])
+            candidates = list(extended_candidates)
+
+        candidates.sort(key=lambda n: self.distance(n, q))
+        return candidates[:M]
+
+    def knn_search(self, q, K, ef):
+        #ALGORTIHM 5
+        if not self.enter_point:
+            return []
+
+        W = []
+        ep = self.enter_point
+        L = max(ep.neighbors.keys()) if ep.neighbors else 0
+
+        for lc in range(L, 0, -1):
+            W = self.search_layer(q, ep, 1, lc)
+            ep = min(W, key=lambda n: self.distance(n, q))
+
+        W = self.search_layer(q, ep, ef, 0)
+        return sorted(W, key=lambda n: self.distance(n, q))[:K]
+
+#hnsw 3. try
+import numpy as np
+import threading
+from collections import defaultdict
+import heapq
+from queue import PriorityQueue
+
+class SpaceInterface:
+    def __init__(self, dim):
+        self.dim = dim
+
+    def distance(self, p1, p2):
+        raise NotImplementedError("Distance function should be implemented by subclasses.")
+
+class L2Space(SpaceInterface):
+    def distance(self, p1, p2):
+        return np.linalg.norm(p1 - p2)
+
+class VisitedList:
+    def __init__(self, count):
+        self.visited = np.zeros(count, dtype=np.int32)
+        self.tag = 1
+
+    def reset(self):
+        self.tag += 1
+        if self.tag == 2147483647:
+            self.visited.fill(0)
+            self.tag = 1
+
+    def visit(self, node):
+        self.visited[node] = self.tag
+
+    def is_visited(self, node):
+        return self.visited[node] == self.tag
+
+class VisitedListPool:
+    def __init__(self, num_elements):
+        self.visited_lists = [VisitedList(num_elements) for _ in range(10)]
+        self.lock = threading.Lock()
+
+    def get(self):
+        with self.lock:
+            if self.visited_lists:
+                return self.visited_lists.pop()
+            else:
+                return VisitedList(num_elements)
+
+    def release(self, vlist):
+        with self.lock:
+            self.visited_lists.append(vlist)
+
+class HierarchicalNSW:
+    def __init__(self, space, max_elements, M=16, ef_construction=200, random_seed=100):
+        self.data = np.zeros((max_elements, space.dim), dtype=np.float32)
+        self.links = defaultdict(list)
+        self.max_elements = max_elements
+        self.current_count = 0
+        self.M = M
+        self.ef_construction = ef_construction
+        self.level_generator = np.random.default_rng(seed=random_seed)
+        self.space = space
+        self.enter_point = None
+        self.visited_list_pool = VisitedListPool(max_elements)
+
+    def insert(self, point):
+        if self.enter_point is None:
+            self.enter_point = self.current_count
+            self.data[self.current_count] = point
+            self.current_count += 1
+            return
+
+        new_node_id = self.current_count
+        self.data[new_node_id] = point
+        self.current_count += 1
+
+        # Searching for the closest nodes in the graph
+        candidates = self._search_base_layer(self.enter_point, point, self.ef_construction)
+        self._connect_new_node(new_node_id, candidates)
+
+    def _search_base_layer(self, enter_point, point, ef):
+        # Implementation of the greedy search to find ef closest nodes to the 'point'
+        visited = self.visited_list_pool.get()
+        pq = PriorityQueue()
+        pq.put((0, enter_point))
+        visited.visit(enter_point)
+        candidates = []
+
+        while not pq.empty():
+            dist, current_node = pq.get()
+            candidates.append((dist, current_node))
+            for neighbor in self.links[current_node]:
+                if not visited.is_visited(neighbor):
+                    visited.visit(neighbor)
+                    ndist = self.space.distance(self.data[neighbor], point)
+                    pq.put((ndist, neighbor))
+                    if len(candidates) > ef:
+                        heapq.heappop(candidates)
+
+        self.visited_list_pool.release(visited)
+        return candidates
+
+    def _connect_new_node(self, new_node_id, candidates):
+        # Connect the new node to the graph using the candidates
+        for _, node in candidates:
+            self.links[new_node_id].append(node)
+            self.links[node].append(new_node_id)
+            if len(self.links[node]) > self.M:
+                # If the number of connections exceed M, trim connections
+                distances = [(self.space.distance(self.data[n], self.data[node]), n) for n in self.links[node]]
+                self.links[node] = [n for _, n in sorted(distances)[:self.M]]
+
+#fourth hnsw implementation
+import os
+import numpy as np
+import pickle
+import random
+
+class Space:
+    def __init__(self, dim):
+        self.dim = dim
+
+    def distance(self, vec1, vec2):
+        raise NotImplementedError("Distance function is not implemented.")
+
+class L2Space(Space):
+    def distance(self, vec1, vec2):
+        return np.sqrt(np.sum((vec1 - vec2) ** 2))
+
+class InnerProductSpace(Space):
+    def distance(self, vec1, vec2):
+        # Computing distance as 1 - cosine similarity for inner product space
+        return 1 - np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+
+class HNSW:
+    def __init__(self, space='l2', dim=16, M=5, max_elements=1000):
+        if space == 'l2':
+            self.space = L2Space(dim)
+        elif space == 'ip':
+            self.space = InnerProductSpace(dim)
+        else:
+            raise ValueError("Unsupported space type. Use 'l2' or 'ip'.")
+        self.dim = dim
+        self.data = None
+        self.ef_construction = None
+        self.M = None
+        self.index = {}
+        self.enter_point = None
+        self.num_threads = 1
+
+    def init_index(self, max_elements, ef_construction=100, M=16):
+        self.data = np.zeros((max_elements, self.dim), dtype=np.float32)
+        self.ef_construction = ef_construction
+        self.M = M
+        self.index = {i: [] for i in range(max_elements)}
+
+    def set_ef(self, ef):
+        self.ef = ef
+
+    def set_num_threads(self, num_threads):
+        self.num_threads = num_threads
+
+    def add_items(self, data, ids=None):
+        if ids is None:
+            ids = range(len(data))
+        for i, point in zip(ids, data):
+            self.data[i] = point
+            self._insert_point(i)
+
+    def _insert_point(self, point_id):
+        if self.enter_point is None:
+            self.enter_point = point_id
+            return
+
+        # Insert logic (simplified)
+        candidates = self._search_base_layer(self.enter_point, self.data[point_id], self.ef_construction)
+        self._connect_new_node(point_id, candidates)
+
+    def _search_base_layer(self, enter_point, point, ef):
+        # Dummy search logic
+        return [(0, enter_point)]
+
+    def _connect_new_node(self, new_node_id, candidates):
+        for _, node in candidates:
+            self.index[new_node_id].append(node)
+            self.index[node].append(new_node_id)
+            if len(self.index[node]) > self.M:
+                self.index[node] = self.index[node][:self.M]
+
+    def knn_query(self, data, k=1):
+        labels = np.zeros((len(data), k), dtype=int)
+        distances = np.zeros((len(data), k), dtype=float)
+
+        # Dummy knn logic
+        for i, point in enumerate(data):
+            nearest = self._search_base_layer(self.enter_point, point, k)
+            for j, (dist, idx) in enumerate(nearest):
+                labels[i, j] = idx
+                distances[i, j] = dist
+        return labels, distances
+
+    def save_index(self, path):
+        with open(path, 'wb') as f:
+            pickle.dump((self.data, self.index, self.enter_point), f)
+
+    def load_index(self, path, max_elements=None):
+        with open(path, 'rb') as f:
+            self.data, self.index, self.enter_point = pickle.load(f)
+        if max_elements is not None:
+            max_capacity = max(max_elements, self.data.shape[0])
+            if max_capacity > self.data.shape[0]:
+                new_data = np.zeros((max_capacity, self.dim), dtype=np.float32)
+                new_data[:self.data.shape[0]] = self.data
+                self.data = new_data
+                for i in range(self.data.shape[0], max_capacity):
+                    self.index[i] = []
+
+#RedSEA subprocess
+# Load the TIFF file for the mask
+mask = read_tiff_image(mask_tiff_path)
+#mask = label(mask, background=0) # ensure labels are consecutive ## skimage.measure.label
+# Calculating properties
+cellNum = len(np.unique(mask[mask != 0]))  # note that background label (0)
+print(cellNum)
+# Get dimensions of the mask
+rowNum, colNum = mask.shape
+
+# Initialize the cell-cell shared perimeter matrix container
+cellPairMap = np.zeros((cellNum, cellNum))  # Indexing starts at 1
+
+# Add a border to the segmentation mask
+mask_border = np.pad(mask, pad_width=1, mode='constant', constant_values=0)
+
+# Loop through the mask and compute the cell-cell contact matrix
+for i in range(1, rowNum + 1):  # Adjusted for the border
+    for j in range(1, colNum + 1):  # Adjusted for the border
+        if mask_border[i, j] == 0:
+            tempMatrix = mask_border[i-1:i+2, j-1:j+2]  # 3x3 window
+            tempFactors = np.unique(tempMatrix)  # Unique cell IDs in the window
+            tempFactors = tempFactors[tempFactors > 0]  # Remove background
+
+            if len(tempFactors) > 1:
+                for k in range(len(tempFactors)):
+                    for l in range(k + 1, len(tempFactors)):
+                        cellPairMap[tempFactors[k], tempFactors[l]] += 1
+
+# Make the cellPairMap symmetric
+cellPairMap += cellPairMap.T
+
+# Optionally remove diagonal to ignore self-pairing
+np.fill_diagonal(cellPairMap, 0)
+
+# functions for tiff to h5ad - needed for unmodified UTAG
+def extract_data_from_tiffs(feature_tiff_path, mask_tiff_path):
+    feature_img = read_tiff_image(feature_tiff_path)
+    mask = read_tiff_image(mask_tiff_path)
+
+    centroids = calculate_centroids(mask)
+    cell_ids = np.unique(mask[mask != 0])  # Exclude background
+
+    num_channels = feature_img.shape[0]
+    data = np.zeros((len(cell_ids), num_channels))  # Storage for cell data
+
+    global_means = np.zeros(num_channels)
+    global_stds = np.zeros(num_channels)
+
+    for channel in range(num_channels):
+        channel_data = feature_img[channel, :, :]
+        global_means[channel] = np.mean(channel_data[mask != 0])
+        global_stds[channel] = np.std(channel_data[mask != 0])
+
+        for i, cell_id in enumerate(cell_ids):
+            cell_data = channel_data[mask == cell_id]
+            data[i, channel] = np.mean(cell_data)  # Store mean per cell per channel
+
+    return data, cell_ids, centroids, global_means, global_stds
+
+# Assuming a csv is provided with channel names
+def create_anndata(feature_tiff_path, mask_tiff_path, channels_csv_path):
+    channels_df = pd.read_csv(channels_csv_path)
+    data, cell_ids, centroids, global_means, global_stds = extract_data_from_tiffs(feature_tiff_path, mask_tiff_path)
+
+    obs_df = pd.DataFrame({
+        'roi': cell_ids,
+        'X_centroid': [centroids[id][1] for id in cell_ids],
+        'Y_centroid': [centroids[id][0] for id in cell_ids]
+    })
+
+    var_df = pd.DataFrame({
+        'mean': global_means,
+        'std': global_stds
+    }, index=channels_df['channel'])
+
+    adata = AnnData(X=data, obs=obs_df, var=var_df)
+    adata.obsm['spatial'] = np.array(adata.obs[['Y_centroid', 'X_centroid']])
+    return adata
+# Usage: Create the AnnData object
+#adata = create_anndata(feature_tiff_path, mask_tiff_path, channels_csv_path)
