@@ -1,1 +1,2 @@
 # RedseaUTAG
+This repository contains the Python scripts and Jupyter notebooks used in the analysis of high-dimensional tissue imaging data for a master's thesis. The thesis examines the integration of the REDSEA (REinforcement Dynamic Spillover Elimination) and UTAG (Unsupervised discovery of Tissue Architecture with Graphs) algorithms to improve the accuracy and efficiency of tissue slide image annotation and classification.
